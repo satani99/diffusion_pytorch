@@ -1,4 +1,4 @@
-# Stable Diffusion PyTorch Implementation
+# Stable Diffusion PyTorch Implementation [WIP]
 
 A PyTorch implementation of the Stable Diffusion model for image generation.
 
