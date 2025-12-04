@@ -17,9 +17,8 @@ This project implements a complete Stable Diffusion model with the following com
 diffusion_pytorch/
 ├── sd/
 │   ├── __init__.py         # Package initialization
-│   ├── attention.py         # Self-attention mechanism
+│   ├── attention.py         # Self-attention and Cross-attention mechanism
 │   ├── clip.py              # CLIP text encoder
-│   ├── cross_attention.py   # Cross-attention for conditioning
 │   ├── decoder.py           # VAE decoder
 │   ├── encoder.py           # VAE encoder
 │   ├── timestep_embedding.py # Sinusoidal positional embeddings

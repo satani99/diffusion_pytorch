@@ -1,88 +1,200 @@
+from sd.unet import SwitchSequential
 import torch
 from torch import nn
-import math
+from torch.nn import functional as F
+from attention import SelfAttention, CrossAttention
 
+class TimeEmbedding(nn.Module):
+    def __init__(self, n_embed):
+        super().__init__()
+        self.linear_1 = nn.Linear(n_embed, 4 * n_embed)
+        self.linear_2 = nn.Linear(4 * n_embed, 4 * n_embed)
 
-class DiffusionScheduler:
-    """DDPM-style scheduler for diffusion process"""
-    
-    def __init__(self, n_steps=1000, beta_start=0.00085, beta_end=0.0120):
-        self.n_steps = n_steps
+    def forward(self, x):
+        x = self.linear_1(x)
+
+        x = F.silu(x)
+
+        x = self.linear_2(x)
+
+        return x 
+
+class UNET_ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, n_time=1280):
+        super().__init__()
+        self.groupnorm_feature = nn.GroupNorm(32, in_channels)
+        self.conv_feature = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.linear_time = nn.Linear(n_time, out_channels)
+
+        self.groupnorm_merged = nn.GroupNorm(32, out_channels)
+        self.conv_merged = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
+        if in_channels == out_channels:
+            self.residual_layer = nn.Identity()
+        else:
+            self.residual_layer = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0)
+
+    def forward(self, feature, time):
+        residue = feature 
+
+        feature = self.groupnorm_feature(feature)
+
+        feature = F.silu(feature)
+        feature = self.conv_feature(feature)
+        time = F.silu(time)
+        time = self.linear_time(time)
+        merged = feature + time.unsqueezer(-1).unsqueeze(-1)
+        merged = self.groupnorm_merged(merged)
+        merged = F.silu(merged)
+        merged = self.conv_merged(merged)
+        return merged + self.residual_layer(residue)
+
+class UNET_AttentionBlock(nn.Module):
+    def __init__(self, n_head: int, n_embed: int, d_context=768):
+        super().__init__()
+        channels = n_head * n_embed 
+
+        self.groupnorm = nn.GroupNorm(32, channels, eps=1e-6)
+        self.conv_input = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+
+        self.layernorm_1 = nn.LayerNorm(channels)
+        self.attention_1 = SelfAttention(n_head, channels, in_proj_bias=False)
+        self.layernorm_2 = nn.LayerNorm(channels)
+        self.attention_2 = CrossAttention(n_head, channels, d_context, in_proj_bias=False)
+        self.layernorm_3 = nn.LayerNorm(channels)
+        self.linear_geglu_1 = nn.Linear(channels, 4 * channels * 2)
+        self.linear_geglu_2 = nn.Linear(4 * channels, channels)
+
+        self.conv_output = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+
+    def forward(self, x, context):
+        residue_long = x 
         
-        # Create a linear schedule for beta values
-        self.beta = torch.linspace(beta_start, beta_end, n_steps)
-        self.alpha = 1.0 - self.beta
-        self.alpha_cumprod = torch.cumprod(self.alpha, dim=0)
+        x = self.groupnorm(x)
+        x = self.conv_input(x)
+
+        n, c, h, w = x.shape 
+
+        x = x.view((n, c, h * w))
+
+        x = x.transpose(-1, -2)
+
+        residue_short = x 
+
+        x = self.layernorm_1(x)
+
+        x = self.attention_1(x)
+
+        x += residue_short 
+
+        residue_short = x 
+
+        x = self.layernorm_2(x)
+        x = self.attention_2(x, context)
+        x += residue_short 
         
-    def add_noise(self, x0, t, noise):
-        """Add noise to the original image at timestep t"""
-        sqrt_alpha_cumprod_t = torch.sqrt(self.alpha_cumprod[t])[:, None, None, None]
-        sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1.0 - self.alpha_cumprod[t])[:, None, None, None]
+        residue_short = x 
+
+        x = self.layernorm_3(x)
+
+        x, gate = self.linear_geglu_1(x).chunk(2, dim=-1)
+
+        x = x * F.gelu(gate)
+
+        x = self.linear_geglu_2(x)
+
+        x += residue_short 
+
+        x = x.transpose(-1, -2)
+
+        x = x.view((n, c, h, w))
         
-        return sqrt_alpha_cumprod_t * x0 + sqrt_one_minus_alpha_cumprod_t * noise
-    
-    def get_velocity(self, x0, noise, t):
-        """Compute velocity prediction target"""
-        sqrt_alpha_cumprod_t = torch.sqrt(self.alpha_cumprod[t])[:, None, None, None]
-        sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1.0 - self.alpha_cumprod[t])[:, None, None, None]
-        
-        return sqrt_alpha_cumprod_t * noise - sqrt_one_minus_alpha_cumprod_t * x0
-    
-    @torch.no_grad()
-    def sample(self, model, context, shape, device='cuda'):
-        """Sample from the diffusion model using DDPM"""
-        x = torch.randn(shape, device=device)
-        
-        for t in range(self.n_steps - 1, -1, -1):
-            # Get current timestep
-            t_tensor = torch.tensor([t], device=device).expand(shape[0])
-            
-            # Predict noise
-            predicted_noise = model(x, context, t_tensor)
-            
-            # Compute alpha and beta values for current step
-            alpha_t = self.alpha[t].to(device)
-            alpha_cumprod_t = self.alpha_cumprod[t].to(device)
-            beta_t = self.beta[t].to(device)
-            
-            # Predict x0 from current noisy image
-            pred_x0 = (x - torch.sqrt(1.0 - alpha_cumprod_t) * predicted_noise) / torch.sqrt(alpha_cumprod_t)
-            
-            # Direction pointing to x_t
-            pred_dir = torch.sqrt(beta_t) * predicted_noise
-            
-            if t > 0:
-                x = torch.sqrt(alpha_t) * pred_x0 + torch.sqrt(1.0 - alpha_t) * torch.randn_like(x)
+        return self.conv_output(x) + residue_long 
+
+class Upsample(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        x = F.interpolate(x, scale_factor=2, mode='nearest')
+        return self.conv(x)
+
+class SwitchSequential(nn.Sequential):
+    def forward(self, x, context, time):
+        for layer in self:
+            if isinstance(layer, UNET_AttentionBlock):
+                x = layer(x, context)
+            elif isinstance(layer, UNET_ResidualBlock):
+                x = layer(x, time)
             else:
-                x = pred_x0
-                
+                x = layer(x)
         return x
-
-
-class Diffusion(nn.Module):
-    """Main diffusion model"""
     
+class UNET(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = None  # Will be set externally
-        self.scheduler = DiffusionScheduler()
-    
-    def set_model(self, model):
-        """Set the UNet model"""
-        self.model = model
-    
-    def forward(self, x, context, t):
-        """Forward pass through the diffusion model"""
-        return self.model(x, context, t)
+        self.encoders = nn.ModuleList([
+            SwitchSequential(nn.Conv2d(4, 320, kernel_size=3, padding=1)),
+            SwitchSequential(UNET_ResidualBlock(320, 320), UNET_AttentionBlock(8, 40)),
+            SwitchSequential(UNET_ResidualBlock(320, 320), UNET_AttentionBlock(8, 40)),
+            SwitchSequential(nn.Conv2d(320, 320, kernel_size=3, stride=2, padding=1)),
+            SwitchSequential(UNET_ResidualBlock(320, 640), UNET_AttentionBlock(8, 80)),
+            SwitchSequential(UNET_ResidualBlock(640, 640), UNET_AttentionBlock(8, 80)),
+            SwitchSequential(nn.Conv2d(640, 640, kernel_size=3, stride=2, padding=1)),
+            SwitchSequential(UNET_ResidualBlock(640, 1280), UNET_AttentionBlock(8, 160)),
+            SwitchSequential(UNET_ResidualBlock(1280, 1280), UNET_AttentionBlock(8, 160)),
+            SwitchSequential(nn.Conv2d(1280, 1280, kernel_size=3, stride=2, padding=1)),
+            SwitchSequential(UNET_ResidualBlock(1280, 1280)),
+            SwitchSequential(UNET_ResidualBlock(1280, 1280)),
+        ])
 
+        self.bottleneck = SwitchSequential(
+            UNET_ResidualBlock(1280, 1280),
+            UNET_AttentionBlock(8, 160),
+            UNET_ResidualBlock(1280, 1280),
+        )
 
-def get_time_embedding(timesteps, dim=320):
-    """Create sinusoidal time embeddings"""
-    device = timesteps.device
-    half_dim = dim // 2
-    embeddings = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-    embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-    embeddings = timesteps[:, None] * embeddings[None, :]
-    embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-    return embeddings
+        self.decoders = nn.ModuleList([
+            SwitchSequential(UNET_ResidualBlock(2560, 1280)),
+            SwitchSequential(UNET_ResidualBlock(2560, 1280)),
+            SwitchSequential(UNET_ResidualBlock(2560, 1280), Upsample(1280)),
+            SwitchSequential(UNET_ResidualBlock(2560, 1280), UNET_AttentionBlock(8, 160)),
+            SwitchSequential(UNET_ResidualBlock(2560, 1280), UNET_AttentionBlock(8, 160)),
+            SwitchSequential(UNET_ResidualBlock(1920, 1280), UNET_AttentionBlock(8, 160), Upsample(1280)),
+            SwitchSequential(UNET_ResidualBlock(1920, 640), UNET_AttentionBlock(8, 80)),
+            SwitchSequential(UNET_ResidualBlock(1280, 640), UNET_AttentionBlock(8, 80)),
+            SwitchSequential(UNET_ResidualBlock(960, 640), UNET_AttentionBlock(8, 80), Upsample(640)),       
+            SwitchSequential(UNET_ResidualBlock(960, 320), UNET_AttentionBlock(8, 40)),
+            SwitchSequential(UNET_ResidualBlock(640, 320), UNET_AttentionBlock(8, 40)),
+            SwitchSequential(UNET_ResidualBlock(640, 320), UNET_AttentionBlock(8, 40)),
+        ])
 
+class UNET_OutputLayer(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.groupnorm = nn.GroupNorm(32, in_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        x = self.groupnorm(x)
+
+        x = F.silu(x)
+
+        x = self.conv(x)
+        return x 
+
+class Diffusion(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.time_embedding = TimeEmbedding(320)
+        self.unet = UNET()
+        self.final = UNET_OutputLayer(320, 4)
+
+    def forward(self, latent, context, time):
+        time = self.time_embedding(time)
+
+        output = self.unet(latent, context, time)
+        output = self.final(output)
+
+        return output 

@@ -1,9 +1,8 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from sd.attention import SelfAttention
-from sd.cross_attention import CrossAttention
-from sd.timestep_embedding import SinusoidalPositionalEmbedding
+from attention import SelfAttention, CrossAttention
+from timestep_embedding import SinusoidalPositionalEmbedding
 
 
 class SwitchSequential(nn.Sequential):
